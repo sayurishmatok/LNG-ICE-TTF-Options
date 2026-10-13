@@ -1,0 +1,1194 @@
+import time
+
+import pandas as pd
+import os
+import numpy as np
+from math import log, sqrt, exp
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from scipy.optimize import brentq
+
+import requests as rq
+from datetime import datetime, timedelta
+import json
+import sys
+import icepython as ice
+
+project_root = r"C:\Users\SayuriShmatook\Levmet\London - Documents\NG\Coding\Scripts\pythonProject\Codes"
+sys.path.append(project_root)
+
+from dotenv import load_dotenv
+from utils.config import db_usr, db_pwd
+
+from Databases.Prices import Prices, OptionsParameters, OptionsValues, FuturesParameters, ExpiryParameters, ExpiryValues, ICEBlockDeals
+from Databases.Database import Table
+
+def get_front_month(db):
+
+    expiry_params = Table(
+        declarative_table=ExpiryParameters,
+        db_name="prices",
+        table_name="expiry_parameters",
+        db_details=db.db_details
+    )
+
+    expiry_values = Table(
+        declarative_table=ExpiryValues,
+        db_name="prices",
+        table_name="expiry_values",
+        db_details=db.db_details
+    )
+
+    params = expiry_params.filter_on_str_column({
+        "Product": ["TFO"]
+    })
+
+    today = datetime.now()
+
+    candidates = []
+
+    for p in params:
+
+        vals = expiry_values.filter_on_str_column({
+            "ID": [p.ID]
+        })
+
+        if not vals:
+            continue
+
+        expiry = vals[0].Value
+
+        days_to_expiry = (expiry - today).days
+
+        if days_to_expiry > 5:
+            candidates.append(
+                (expiry, p.Period)
+            )
+
+    candidates.sort()
+
+    if not candidates:
+        raise ValueError("No front month found with >5 days to expiry")
+    
+    return candidates[0][1]
+
+def get_front_month_contracts(db, period, product, parameter_class, table_name, contract_type):
+
+    t = Table(
+        declarative_table=parameter_class,
+        db_name="prices",
+        table_name=table_name,
+        db_details=db.db_details
+    )
+
+    rows = t.filter_on_str_column({
+        "Product": [product],
+        "Period": [period],
+        "Field": ["Settle"]
+    })
+
+    contracts = set()
+
+    for r in rows:
+        if contract_type == "option":
+            contracts.add((r.Period, r.Option_Type, r.Strike))
+        elif contract_type == "future":
+            contracts.add((r.Period, None, None))
+        else:
+            raise ValueError("Invalid contract_type. Must be 'option' or 'future'.")
+
+    return sorted(list(contracts))
+        
+def build_ice_symbol(period, contract_type, option_type=None, strike=None, product=None):
+
+    month_map = {"JAN": "F","FEB": "G","MAR": "H","APR": "J","MAY": "K","JUN": "M","JUL": "N","AUG": "Q","SEP": "U","OCT": "V","NOV": "X","DEC": "Z",}
+
+    ice_mapping = {"TTF": "TFM",}
+    ice_product = ice_mapping.get(product, product)
+
+    month, year = period.split("-")
+    year = year[-2:]
+
+    if contract_type == 'option':
+        strike_code = int(round(strike * 100))
+
+        return (
+            f"{ice_product} "
+            f"{year}"
+            f"{month_map[month]}"
+            f"{option_type}"
+            f"{strike_code}"
+            f"-ICN"
+        )
+
+    elif contract_type == 'future':
+        return (
+            f"{ice_product} "
+            f"{year}"
+            f"{month_map[month]}"
+            f"-ICN"
+        )
+    else:
+        raise ValueError("Invalid contract_type. Must be 'option' or 'future'.")
+
+def timesales_to_df(symbol, product, period, data, option_type=None, strike=None):
+
+    headers = data[0]
+    rows = data[1:]
+
+    df = pd.DataFrame(rows, columns=headers)
+
+    df["Symbol"] = symbol
+    df["Product"] = product
+    df["Period"] = period
+    df["Option_Type"] = option_type
+    df["Strike"] = strike
+
+    df.rename(
+        columns={
+            "Time": "Trade_Time",
+            f"{symbol}.Price": "Price",
+            f"{symbol}.Size": "Size",
+            f"{symbol}.Conditions": "Conditions"
+        },
+        inplace=True
+    )
+
+    if "Conditions" not in df.columns:
+        df["Conditions"] = None
+
+    return df[
+        [
+            "Symbol",
+            "Product",
+            "Period",
+            "Option_Type",
+            "Strike",
+            "Trade_Time",
+            "Price",
+            "Size",
+            "Conditions"
+        ]
+    ]
+
+def build_deals(df, window_seconds=180):
+
+    df = df.sort_values(
+        ["Symbol", "Price", "Trade_Time"]
+    ).copy()
+
+    deal_counter = 0
+
+    all_groups = []
+
+    for (symbol, price), grp in df.groupby(
+        ["Symbol", "Price"]
+    ):
+
+        grp = grp.sort_values("Trade_Time").copy()
+
+        deal_ids = []
+
+        previous_time = None
+
+        for _, row in grp.iterrows():
+
+            if previous_time is None:
+
+                deal_counter += 1
+
+            else:
+
+                gap = (
+                    row["Trade_Time"]
+                    - previous_time
+                ).total_seconds()
+
+                if gap > window_seconds:
+
+                    deal_counter += 1
+
+            deal_ids.append(deal_counter)
+
+            previous_time = row["Trade_Time"]
+
+        grp["DealID"] = deal_ids
+
+        all_groups.append(grp)
+
+    return pd.concat(all_groups).sort_values("Trade_Time")
+
+def get_max_deal_id(db):
+
+    deals_table = Table(
+        declarative_table=ICEBlockDeals,
+        db_name="prices",
+        table_name="ice_block_deals",
+        db_details=db.db_details
+    )
+
+    max_id = deals_table.find_min_max_value_in_column(
+        column_name="DealID",
+        min_max="max"
+    )
+
+    if not max_id:
+        return 0
+
+    return int(max_id)
+
+def collect_contract_type(db, front_month, contract_type, parameter_class, table_name, product):
+    
+    contracts = get_front_month_contracts(db,front_month, product, parameter_class, table_name, contract_type) #get all contracts for that month
+
+    contract_symbols = []
+
+    for period, option_type, strike in contracts:
+        symbol = build_ice_symbol(period, contract_type, option_type=option_type, strike=strike, product=product)
+        contract_symbols.append((symbol, period, option_type, strike))
+
+    return contract_symbols
+
+def collect_timesales(contract_symbols, start_time, end_time, product, contract_type):
+
+    dfs = []
+
+    for i in range(0, len(contract_symbols), 10):
+
+        batch_contracts = contract_symbols[i:i + 10]
+        batch_symbols = [s[0] for s in batch_contracts]
+
+        if contract_type == "option":
+
+            data = list(
+                ice.get_timesales(
+                    batch_symbols,
+                    ["Price", "Size", "Conditions"],
+                    start_time,
+                    end_time,
+                    filter="Blocks"
+                )
+            )
+
+        else:
+
+            data = list(
+                ice.get_timesales(
+                    batch_symbols,
+                    ["Price", "Size"],
+                    start_time,
+                    end_time
+                )
+            )
+
+        if len(data) <= 1:
+            continue
+
+        if data[0][0] == "Error":
+            print(data[0])
+            continue
+
+        headers = data[0]
+        rows = data[1:]
+
+        for symbol, period, option_type, strike in batch_contracts:
+
+            symbol_headers = [
+                "Time",
+                f"{symbol}.Price",
+                f"{symbol}.Size"
+            ]
+
+            if contract_type == "option":
+                symbol_headers.append(
+                    f"{symbol}.Conditions"
+                )
+
+            try:
+                idxs = [
+                    headers.index(col)
+                    for col in symbol_headers
+                ]
+
+            except ValueError:
+                continue
+
+            symbol_data = [symbol_headers]
+
+            for row in rows:
+
+                symbol_row = [
+                    row[i]
+                    for i in idxs
+                ]
+
+                if symbol_row[1] is None:
+                    continue
+
+                symbol_data.append(symbol_row)
+
+            if len(symbol_data) <= 1:
+                continue
+
+            dfs.append(
+                timesales_to_df(
+                    symbol=symbol,
+                    product=product,
+                    period=period,
+                    data=symbol_data,
+                    option_type=option_type,
+                    strike=strike
+                )
+            )
+
+        time.sleep(1)
+
+    if not dfs:
+
+        print(f"No {contract_type} trades found")
+
+        return pd.DataFrame()
+
+    df = (
+        pd.concat(dfs)
+        .reset_index(drop=True)
+    )
+
+    if contract_type == "option":
+
+        df["Has_Leg_Flag"] = (
+            df["Conditions"]
+            .fillna("")
+            .str.contains("Leg", regex=False)
+        )
+
+    df["Trade_Time"] = pd.to_datetime(
+        df["Trade_Time"]
+    )
+
+    print(
+        f"Trades found for "
+        f"{contract_type}: "
+        f"{len(df)}"
+    )
+
+    return df
+
+def group_deals(db, df, max_deal_id):
+
+    df = build_deals(df)
+
+    deals = (
+        df.groupby("DealID")
+        .agg(
+            Symbol=("Symbol", "first"),
+            Product=("Product", "first"),
+            Period=("Period", "first"),
+            Option_Type=("Option_Type", "first"),
+            Strike=("Strike", "first"),
+            Deal_Price=("Price", "first"),
+            Total_Size=("Size", "sum"),
+            Start_Time=("Trade_Time", "min"),
+            End_Time=("Trade_Time", "max"),
+            Has_Leg_Flag=("Has_Leg_Flag", "max")
+        )
+        .reset_index()
+    )
+
+    deals["OldDealID"] = deals["DealID"]
+
+    deals = deals.sort_values(
+        "Start_Time"
+    ).reset_index(drop=True)
+
+    deals["DealID"] = range(
+        max_deal_id + 1,
+        max_deal_id + 1 + len(deals)
+    )
+
+    mapping = dict(
+        zip(
+            deals["OldDealID"],
+            deals["DealID"]
+        )
+    )
+
+    df["DealID"] = df["DealID"].map(mapping)
+
+    deals.drop(
+        columns=["OldDealID"],
+        inplace=True
+    )
+
+    return df, deals
+
+def upload_to_db(db, trades_df, deals_df, trades_table, deals_table, contract_type):
+
+    trade_cols = ["Symbol", "Product", "Period", "Option_Type", "Strike", "Trade_Time", "Price", "Size", "Conditions"]
+    trades_upload_df = trades_df[trade_cols].copy()
+
+    if contract_type == "option":
+        trade_cols = ["DealID"] + trade_cols
+
+        db.upload_data_from_df(
+            table_name=trades_table,
+            primary_key_columns=[
+                "Symbol",
+                "Trade_Time",
+                "Price",
+                "Size"
+            ],
+            df=trades_upload_df
+        )
+
+        db.upload_data_from_df(
+            table_name=deals_table,
+            primary_key_columns=[
+                "DealID"
+            ],
+            df=deals_df
+        )
+
+        print(f"Inserted {len(trades_upload_df)} option trades")
+
+    elif contract_type == "future":
+
+        futures_upload_df = trades_df.drop(
+            columns=["Has_Leg_Flag"],
+            errors="ignore"
+        )
+
+        futures_upload_df = futures_upload_df.drop_duplicates(
+            subset=[
+                "Symbol",
+                "Trade_Time",
+                "Price",
+                "Size"
+            ]
+        )
+
+        db.upload_data_from_df(
+            table_name=trades_table,
+            primary_key_columns=[
+                "Symbol",
+                "Trade_Time",
+                "Price",
+                "Size"
+            ],
+            df=futures_upload_df
+        )
+
+        print(f"Inserted {len(futures_upload_df)} futures trades")
+
+    else:
+        raise ValueError("contract_type must be 'option' or 'future'")
+
+def get_expiry_for_period(db, product, period):
+
+    expiry_params = Table(
+        declarative_table=ExpiryParameters,
+        db_name="prices",
+        table_name="expiry_parameters",
+        db_details=db.db_details
+    )
+
+    expiry_values = Table(
+        declarative_table=ExpiryValues,
+        db_name="prices",
+        table_name="expiry_values",
+        db_details=db.db_details
+    )
+
+    params = expiry_params.filter_on_str_column({
+        "Product": [product],
+        "Period": [period]
+    })
+
+    if not params:
+        return None
+
+    values = expiry_values.filter_on_str_column({
+        "ID": [params[0].ID]
+    })
+
+    if not values:
+        return None
+
+    return values[0].Value
+
+def black76_price(F, K, T, r, sigma, option_type):
+    """
+    F = futures price
+    K = strike
+    T = time to expiry (years)
+    r = risk-free rate
+    sigma = volatility
+    option_type = C or P
+    """
+
+    if sigma <= 0 or T <= 0:
+        return None
+
+    d1 = (
+        log(F / K)
+        + 0.5 * sigma**2 * T
+    ) / (sigma * sqrt(T))
+
+    d2 = d1 - sigma * sqrt(T)
+
+    if option_type.upper() == "C":
+
+        return exp(-r * T) * (
+            F * norm.cdf(d1)
+            - K * norm.cdf(d2)
+        )
+
+    elif option_type.upper() == "P":
+
+        return exp(-r * T) * (
+            K * norm.cdf(-d2)
+            - F * norm.cdf(-d1)
+        )
+
+    else:
+        raise ValueError("option_type must be C or P")
+
+def implied_volatility(market_price, F, K, T, r, option_type):
+
+    def objective(sigma):
+        return (
+            black76_price(F, K, T, r, sigma, option_type) - market_price)
+
+    try:
+        return brentq(objective, 1e-6, 5.0)
+    except ValueError:
+        return None
+
+def get_option_settle(db, product, period, strike, option_type, option_time):
+
+    options_params = Table(
+        declarative_table=OptionsParameters,
+        db_name="prices",
+        table_name="options_parameters",
+        db_details=db.db_details
+    )
+
+    options_values = Table(
+        declarative_table=OptionsValues,
+        db_name="prices",
+        table_name="options_values",
+        db_details=db.db_details
+    )
+
+    raw_params = options_params.filter_on_str_column({
+        "Product": [product],
+        "Period": [period],
+        "Option_Type": [option_type],
+        "Field": ["Settle"]
+    })
+
+    params = pd.DataFrame([vars(x) for x in raw_params])
+    params["Strike"] = params["Strike"].astype(float)
+
+    if params.empty:
+        return None
+
+    params = params[abs(params["Strike"] - strike) < 0.001]
+    
+    if params.empty:
+        return None
+
+    curve_id = params.iloc[0]["ID"]
+
+    values = options_values.filter_on_str_column({"ID": [curve_id]})
+    values = pd.DataFrame([vars(x) for x in values])
+
+    values["Value"] = values["Value"].astype(float)
+    values["Date"] = pd.to_datetime(values["Date"])
+
+    if values.empty:
+        return None
+
+    trade_date = option_time.date()
+    values = values[values["Date"].dt.date < trade_date]
+
+    if values.empty:
+        return None
+
+    return values.sort_values("Date").iloc[-1]["Value"]
+
+def classify_structure(package):
+
+    leg_count = len(package)
+
+    types = package["Option_Type"].tolist()
+    strikes = package["Strike"].astype(float).tolist()
+    expiries = package["Period"].tolist()
+    sides = package["Side"].tolist()
+
+    unique_strikes = len(set(strikes))
+    unique_expiries = len(set(expiries))
+
+    if leg_count == 1:
+        return "Single Leg"
+
+    # Straddle
+    if (
+        leg_count == 2
+        and set(types) == {"C", "P"}
+        and unique_strikes == 1
+        and unique_expiries == 1
+        and len(set(sides)) == 1
+    ):
+        return "Straddle"
+
+    # Strangle
+    if (
+        leg_count == 2
+        and set(types) == {"C", "P"}
+        and unique_strikes == 2
+        and unique_expiries == 1
+        and len(set(sides)) == 1
+    ):
+        return "Strangle"
+
+    # Call Spread
+    if (
+        leg_count == 2
+        and all(t == "C" for t in types)
+        and unique_strikes == 2
+        and unique_expiries == 1
+    ):
+        return "Call Spread"
+
+    # Put Spread
+    if (
+        leg_count == 2
+        and all(t == "P" for t in types)
+        and unique_strikes == 2
+        and unique_expiries == 1
+    ):
+        return "Put Spread"
+
+    # Risk Reversal
+    if (
+        leg_count == 2
+        and set(types) == {"C", "P"}
+        and unique_strikes == 2
+        and unique_expiries == 1
+        and len(set(sides)) == 2
+    ):
+        return "Risk Reversal"
+
+    # Calendar
+    if (
+        leg_count == 2
+        and unique_strikes == 1
+        and unique_expiries == 2
+    ):
+        return "Calendar"
+
+    # Butterfly
+    if (
+        leg_count == 3
+        and len(set(types)) == 1
+        and len(set(strikes)) == 3
+    ):
+
+        return "Butterfly"
+
+    # Fence / Collar
+    if (
+        leg_count == 3
+        and types.count("P") == 2
+        and types.count("C") == 1
+    ):
+        return "Fence"
+
+    return "Other"
+
+def black76_gamma(F, K, T, r, sigma):
+
+    d1 = (
+        log(F / K)
+        + 0.5 * sigma**2 * T
+    ) / (sigma * sqrt(T))
+
+    gamma = (
+        exp(-r * T)
+        * norm.pdf(d1)
+        / (F * sigma * sqrt(T))
+    )
+
+    return gamma
+
+def get_open_interest(db, product, period, strike, option_type, valuation_time):
+
+    options_params = Table(
+        declarative_table=OptionsParameters,
+        db_name="prices",
+        table_name="options_parameters",
+        db_details=db.db_details
+    )
+
+    options_values = Table(
+        declarative_table=OptionsValues,
+        db_name="prices",
+        table_name="options_values",
+        db_details=db.db_details
+    )
+
+    raw_params = options_params.filter_on_str_column({
+        "Product": [product],
+        "Period": [period],
+        "Option_Type": [option_type],
+        "Field": ["Open Interest"]
+    })
+
+    params = pd.DataFrame([vars(x) for x in raw_params])
+
+    if params.empty:
+        return None
+
+    params["Strike"] = params["Strike"].astype(float)
+
+    row = params[
+        abs(params["Strike"] - float(strike)) < 0.001
+    ]
+
+    if row.empty:
+        return None
+
+    param_id = row.iloc[0]["ID"]
+
+    oi_values = pd.DataFrame(
+        [
+            vars(x)
+            for x in options_values.filter_on_str_column(
+                {"ID": [param_id]}
+            )
+        ]
+    )
+
+    if oi_values.empty:
+        return None
+
+    oi_values = oi_values[
+        oi_values["Date"] <= valuation_time
+    ].sort_values("Date")
+
+    if oi_values.empty:
+        return None
+
+    base_oi = float(oi_values.iloc[-1]["Value"])
+
+    if base_oi == 0:
+
+        non_zero = oi_values[
+            oi_values["Value"] > 0
+        ]
+
+        if not non_zero.empty:
+            base_oi = float(
+                non_zero.iloc[-1]["Value"]
+            )
+
+        else:
+            base_oi = 0
+
+    return base_oi
+
+def plot_today_historical(db):
+
+    deals_table = Table(
+        declarative_table=ICEBlockDeals,
+        db_name="prices",
+        table_name="ice_block_deals",
+        db_details=db.db_details
+    )
+
+    raw_deals = deals_table.fetch_all_rows()
+
+    deals = pd.DataFrame([vars(x) for x in raw_deals])
+    deals["Start_Time"] = pd.to_datetime(deals["Start_Time"])
+
+    today = pd.Timestamp.today().normalize()
+
+    today_deals = deals[deals["Start_Time"] >= today].copy()
+    today_deals["GammaExposure"] = pd.to_numeric(today_deals["GammaExposure"], errors="coerce")
+    today_deals = (today_deals.sort_values("Start_Time"))
+
+    today_deals["RunningGammaExposure"] = (
+        today_deals
+        .groupby("Strike")
+        ["GammaExposure"]
+        .cumsum()
+    )
+
+    gamma_profile = (
+        today_deals
+        .groupby("Strike", as_index=False)
+        ["RunningGammaExposure"]
+        .last()
+    )
+
+    return gamma_profile
+
+def collect(db):  
+    front_month = get_front_month(db) #get front month eg OCT-2026
+
+    options_contracts_symbols = collect_contract_type(db, front_month, "option", OptionsParameters, "options_parameters", "TFO") #get all option contracts
+    futures_contracts_symbols = collect_contract_type(db, front_month, "future", FuturesParameters, "futures_parameters", "TTF")
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(minutes=10)
+
+    start_time = start_time.strftime("%Y-%m-%dT%H:%M:%S")
+    end_time = end_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    #collect trades for options and futures within the last 5 minutes
+    options_df = collect_timesales(options_contracts_symbols, start_time, end_time, "TFO", "option") #get all option trades
+    futures_df = collect_timesales(futures_contracts_symbols, start_time, end_time, "TFM", "future")
+
+    #group option trades into deals
+    max_deal_id = get_max_deal_id(db)
+    options_df, options_deals = group_deals(db, options_df, max_deal_id)
+
+    options_deals["IV"] = None
+    options_deals["IV_Status"] = None
+    options_deals["Settle_IV"] = None
+    options_deals["Vol_Move"] = None
+    options_deals["DealerSign"] = None
+    options_deals["PackageID"] = None
+    options_deals["Structure"] = None
+    options_deals["Gamma"] = None
+    options_deals["OpenInterest"] = None
+    options_deals["GammaExposure"] = None
+    options_deals["RunningGammaExposure"] = None
+    options_deals["Side"] = None
+
+    #find futures leg
+    for _, options_deal in options_deals.iterrows():
+
+        option_time = options_deal["Start_Time"]
+
+        prior_futures = futures_df[
+            (futures_df["Trade_Time"] <= option_time)
+            &
+            (
+                futures_df["Trade_Time"]
+                >= option_time - timedelta(seconds=30)
+            )
+        ]
+        
+        #Black-76
+        status = None
+        iv = None
+
+        if prior_futures.empty:
+            status = "NO_FUTURES_MATCH"
+
+        else:
+
+            latest_future = (
+                prior_futures
+                .sort_values("Trade_Time")
+                .iloc[-1]
+            )
+
+            F = float(latest_future["Price"])
+            K = float(options_deal["Strike"])
+            premium = float(options_deal["Deal_Price"])
+            option_type = options_deal["Option_Type"]
+
+            expiry = get_expiry_for_period(db, options_deal["Product"], options_deal["Period"])
+
+            T = None
+
+            if expiry is not None:
+
+                T = (expiry - option_time).total_seconds() / (365 * 24 * 3600)
+
+            if expiry is None:
+                status = "NO_EXPIRY"
+
+            elif T <= 0:
+                status = "EXPIRED"
+
+            else:
+
+                intrinsic = (
+                    max(K - F, 0)
+                    if option_type == "P"
+                    else max(F - K, 0)
+                )
+                
+                time_value = premium - intrinsic
+
+                if time_value <= 0:
+                    status = "NO_TIME_VALUE"
+
+                else:
+
+                    iv = implied_volatility(market_price=premium, F=F, K=K, T=T, r=0.0219, option_type=option_type)
+
+                    if iv is None:
+                        status = "NO_IV_SOLUTION"
+
+                    else:
+                        status = "OK"
+
+        options_deals.loc[
+            options_deals["DealID"] == options_deal["DealID"],
+            "IV"
+        ] = iv
+
+        options_deals.loc[
+            options_deals["DealID"] == options_deal["DealID"],
+            "IV_Status"
+        ] = status
+
+        # compare to settlement
+        settle_iv = None
+        vol_move = None
+        dealer_sign = None
+
+        if status == "OK":
+
+            settle_price = get_option_settle(
+                db,
+                options_deal["Product"],
+                options_deal["Period"],
+                K,
+                option_type,
+                option_time
+            )
+
+            if settle_price is None:
+
+                print(
+                    f"Deal={options_deal['DealID']} | "
+                    f"FAILED: No settlement price found"
+                )
+
+            else:
+
+                # settlement IV calculation
+                other_type = "P" if option_type == "C" else "C"
+                other_settle = get_option_settle(db, options_deal["Product"], options_deal["Period"], K, other_type, option_time)
+
+                if other_settle is None:
+                    status = "NO_OTHER_SETTLE"
+
+                else:
+
+                    call_settle = settle_price if option_type == "C" else other_settle
+                    put_settle = settle_price if option_type == "P" else other_settle
+
+                    parity_forward = K + call_settle - put_settle
+
+                    settle_iv = implied_volatility(market_price=settle_price, F=parity_forward, K=K, T=T, r=0.0219, option_type=option_type) 
+
+                if settle_iv is None:
+
+                    print(
+                        f"Deal={options_deal['DealID']} | "
+                        f"FAILED: Settlement IV calculation returned None | "
+                        f"Type={option_type} | "
+                        f"F={F} | "
+                        f"K={K} | "
+                        f"T={T} | "
+                        f"SettlePrice={settle_price}"
+                    )
+
+                else:
+
+                    vol_move = iv - settle_iv
+
+                    if iv > settle_iv:
+                        dealer_sign = -1 #customer bought vol
+                        side = "Buy"
+                    else:
+                        dealer_sign = 1 #customer sold vol
+                        side = "Sell"
+
+                    options_deals.loc[
+                        options_deals["DealID"] == options_deal["DealID"],
+                        "DealerSign"
+                    ] = dealer_sign
+
+                    options_deals.loc[
+                        options_deals["DealID"] == options_deal["DealID"],
+                        "Side"
+                    ] = side
+
+                    gamma = black76_gamma(F=F, K=K, T=T, r=0.0219, sigma=iv)
+
+                    options_deals.loc[
+                        options_deals["DealID"] == options_deal["DealID"],
+                        "Gamma"
+                    ] = gamma
+
+                    base_oi = get_open_interest(db, options_deal["Product"], options_deal["Period"], K, option_type, option_time)
+                    flow_volume = float(options_deal["Total_Size"])
+
+                    options_deals.loc[
+                        options_deals["DealID"] == options_deal["DealID"],
+                        "OpenInterest"
+                    ] = base_oi
+
+                    if (
+                        gamma is not None  
+                        and base_oi is not None
+                        and dealer_sign is not None
+                    ):
+
+                        oigex = (gamma * base_oi)
+                        flowgex = (gamma * flow_volume * dealer_sign)
+                        total_gex = oigex + flowgex
+
+                        options_deals.loc[
+                            options_deals["DealID"] == options_deal["DealID"],
+                            "GammaExposure"
+                        ] = total_gex
+
+                        print( ######delete
+                            f"Strike={K} | "
+                            f"OI={base_oi} | "
+                            f"Flow={flow_volume} | "
+                            f"OIGEX={oigex:.2f} | "
+                            f"FlowGEX={flowgex:.2f} | "
+                            f"TotalGEX={total_gex:.2f}"
+                        ) ########delete
+
+        options_deals.loc[
+            options_deals["DealID"] == options_deal["DealID"],
+            "Settle_IV"
+        ] = settle_iv
+
+        options_deals.loc[
+            options_deals["DealID"] == options_deal["DealID"],
+            "Vol_Move"
+        ] = vol_move
+
+        if vol_move is not None:
+
+            print(
+                f"Deal {options_deal['DealID']} | "
+                f"Option Type={option_type} | "
+                f"Status={status} | "
+                f"Trade IV={iv:.2%} | "
+                f"Settle IV={settle_iv:.2%} | "
+                f"Vol Move={vol_move:.2%} | "
+                f"DealerSign={dealer_sign}"
+            )
+
+    #phase 3
+    options_deals["PackageTime"] = (
+        options_deals["Start_Time"]
+        .dt.floor("5s")
+    )
+
+    options_deals["PackageID"] = (
+        options_deals
+        .groupby(
+            [
+                "Product",
+                "Period",
+                "PackageTime",
+                "Total_Size",
+                "Deal_Price"
+            ]
+        )
+        .ngroup()
+        + 1
+    )
+
+    options_deals.drop(columns=["PackageTime"],inplace=True)
+
+    for package_id in options_deals["PackageID"].unique():
+        
+        package = options_deals[
+            options_deals["PackageID"] == package_id
+        ]
+
+        structure = classify_structure(package)
+
+        options_deals.loc[
+            options_deals["PackageID"] == package_id,
+            "Structure"
+        ] = structure
+
+    ########DELETE
+    print(
+        options_deals[
+            [
+                "DealID",
+                "PackageID",
+                "Option_Type",
+                "Strike",
+                "Total_Size",
+                "Start_Time"
+            ]
+        ]
+        .sort_values(["PackageID", "Strike"])
+    )
+    ################DELETE
+
+    #phase 4
+    gamma_profile = (
+        options_deals
+        .groupby("Strike", as_index=False)
+        ["GammaExposure"]
+        .sum()
+    )
+
+    print(gamma_profile.sort_values("Strike"))
+
+    #plot today's historical deals
+    historical_gamma_profile = plot_today_historical(db)
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(
+        historical_gamma_profile["Strike"],
+        historical_gamma_profile["RunningGammaExposure"],
+        marker="o"
+    )
+
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Today-to-Date Running Gamma Exposure")
+    plt.xlabel("Strike")
+    plt.ylabel("Running Gamma Exposure")
+    plt.grid(True)
+    plt.savefig("running_gamma_profile.png")
+    print("Saved plot: running_gamma_profile.png")
+    plt.close()
+
+    #upload to database
+    upload_to_db(db, options_df, options_deals, "ice_block_trades", "ice_block_deals", "option")
+    upload_to_db(db, futures_df, None, "ice_block_trades", None, "future")
+
+def main():
+    load_dotenv()
+
+    db = Prices(
+        name=os.getenv("db_name"),
+        db_details={
+            "host": os.getenv("host"),
+            "user": os.getenv("user"),
+            "password": os.getenv("password"),
+            "port": int(os.getenv("port"))
+        }
+    )
+
+    while True:
+        try:
+            collect(db)
+        except Exception as e:
+            print(e)
+
+        print("Sleeping for 10 minutes...")
+        time.sleep(600)
+
+if __name__ == '__main__':
+    main()
