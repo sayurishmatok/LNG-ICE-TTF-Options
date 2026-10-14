@@ -11,7 +11,7 @@ Key Features
 1. Trade and Hedge Reconstruction
 
 * Processed 12,736 option contracts and 5.85M historical observations using SQL and Python.
-* Matched option transactions with associated futures hedges and structured trade-level datasets for downstream analytics.
+* Matched option transactions with associated futures hedges to analyse implied volatility and quantify gamma exposure across strikes and maturities.
 
 2. Implied Volatility Modelling
 
