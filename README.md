@@ -1,44 +1,41 @@
 ICE TTF Gas Options Analytics
 
-A Python-based quantitative analytics project focused on ICE TTF natural gas options, historical trade analysis, implied volatility reconstruction, gamma exposure, and market positioning.
+Python/SQL quantitative research project for ICE TTF natural gas options, focusing on trade reconstruction, implied volatility extraction, gamma exposure, and multi-leg transaction analysis.
 
 Overview
 
-This project analyses historical ICE TTF gas-options transactions and associated futures hedges to reconstruct traded implied volatility, compare market activity against desk volatility marks, and quantify options-related exposure across strikes and maturities.
-
-Using SQL and Python, the project processes large-scale historical market data to investigate intraday volatility dynamics, options positioning, and multi-leg transaction structures.
+Developed a data-driven analytics pipeline to reconstruct option trades and associated futures hedges, infer traded implied volatility from market prices, and analyse exposure and positioning across strikes, expiries, and intraday intervals.
 
 Key Features
 
-1. Trade and Hedge Matching
+1. Trade and Hedge Reconstruction
 
-* Processed 12,736 option contracts and 5.85 million historical observations using SQL and Python.
-* Matched option trades with their associated ICE TTF futures hedges.
-* Structured historical trade data for downstream volatility and exposure analysis.
+* Processed 12,736 option contracts and 5.85M historical observations using SQL and Python.
+* Matched option transactions with associated futures hedges and structured trade-level datasets for downstream analytics.
 
-2. Implied Volatility Reconstruction
+2. Implied Volatility Modelling
 
-* Inverted the Black-76 option pricing model to recover implied volatility from traded option prices.
-* Analysed reconstructed implied volatility across strikes and maturities.
-* Designed 5-minute intraday comparisons between trade-implied volatility and desk volatility marks to examine market pricing differences and intraday dynamics.
+* Numerically inverted the Black-76 pricing model to recover implied volatility from traded option prices.
+* Designed 5-minute intraday volatility comparisons against desk marks to analyse deviations in market-implied volatility across strikes and maturities.
 
 3. Gamma Exposure Analysis
 
-* Quantified gamma exposure across option strikes and maturities.
-* Examined the distribution of options-related exposure across the volatility surface.
-* Identified concentrations of gamma exposure to support analysis of potential market sensitivity to movements in underlying futures prices.
+* Calculated option gamma exposure across strikes and maturities to identify concentrations of convexity exposure.
+* Analysed the distribution of exposure across the options surface to assess sensitivity to underlying futures price movements.
 
-4. Multi-Leg Transaction Classification
+4. Multi-Leg Trade Classification
 
-* Classified multi-leg ICE transactions to identify larger options structures.
-* Analysed transaction composition and positioning concentrations across strikes and maturities.
-* Developed a framework for examining how individual option trades contribute to broader market positioning.
+* Classified multi-leg ICE transactions to identify complex option structures and aggregate related trading activity.
+* Analysed strike-, maturity-, and structure-level concentrations to investigate market positioning.
 
 Methodology
 
-The analytical workflow consists of four main stages:
+1. Data processing: SQL-based extraction, filtering, and joining of historical options and futures observations.
+2. Trade reconstruction: Matching option executions with associated futures hedges and normalising trade-level records.
+3. Volatility calibration: Numerical inversion of Black-76 using observed option prices and relevant contract parameters.
+4. Exposure analytics: Gamma calculation and aggregation across strikes and maturities.
+5. Intraday analysis: Five-minute alignment of trade-implied volatility with desk marks and classification of multi-leg transactions for positioning analysis.
 
-1. Data extraction and preparation — query historical options, futures, and market observations using SQL.
-2. Trade reconstruction — match option transactions with associated futures hedges and organise trades into a consistent analytical dataset.
-3. Volatility and exposure modelling — invert Black-76 to recover implied volatility and calculate gamma-related exposure metrics.
-4. Intraday and positioning analysis — compare reconstructed volatility with desk marks at five-minute intervals and classify multi-leg transactions to investigate positioning concentrations.
+Technology Stack
+
+Python · SQL · Black-76 · Numerical Optimisation · Derivatives Analytics · Time-Series Analysis
